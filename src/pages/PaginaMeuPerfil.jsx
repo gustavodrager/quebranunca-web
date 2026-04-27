@@ -1,0 +1,616 @@
+import { useEffect, useState } from 'react';
+import { useAutenticacao } from '../hooks/useAutenticacao';
+import { atletasServico } from '../services/atletasServico';
+import { usuariosServico } from '../services/usuariosServico';
+import { extrairMensagemErro } from '../utils/erros';
+import {
+  formatarCpfParaInput,
+  formatarTelefoneParaInput,
+  limparCpf,
+  limparTelefone,
+  normalizarDataParaApi,
+  paraInputData,
+  validarCpf
+} from '../utils/formatacao';
+import { opcoesNivelAtleta } from '../utils/niveisAtleta';
+import { PERFIS_USUARIO } from '../utils/perfis';
+import { nomeEstadoAcesso } from '../utils/acesso';
+import { buscarCidadesPorEstado, estadosBrasil, normalizarEstadoParaUf } from '../utils/localidadesBrasil';
+import { rolarParaTopo } from '../utils/rolagem';
+
+const estadoInicialAtleta = {
+  nome: '',
+  apelido: '',
+  telefone: '',
+  email: '',
+  instagram: '',
+  cpf: '',
+  bairro: '',
+  cidade: '',
+  estado: '',
+  cadastroPendente: false,
+  nivel: '',
+  lado: '3',
+  dataNascimento: ''
+};
+
+const mensagemErroAcessoOrganizador =
+  'O organizador só pode alterar atletas inscritos em competições vinculadas ao próprio usuário.';
+const dataMinimaNascimento = '1900-01-01';
+
+function obterDataMaximaNascimento() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function validarDataNascimento(dataNascimento) {
+  if (!dataNascimento) {
+    return null;
+  }
+
+  const dataNormalizada = dataNascimento.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dataNormalizada)) {
+    return 'Informe uma data de nascimento válida.';
+  }
+
+  const [ano, mes, dia] = dataNormalizada.split('-').map(Number);
+  const data = new Date(Date.UTC(ano, mes - 1, dia));
+  const dataValida =
+    data.getUTCFullYear() === ano &&
+    data.getUTCMonth() === mes - 1 &&
+    data.getUTCDate() === dia;
+
+  if (!dataValida) {
+    return 'Informe uma data de nascimento válida.';
+  }
+
+  if (dataNormalizada < dataMinimaNascimento) {
+    return 'Data de nascimento inválida.';
+  }
+
+  if (dataNormalizada > obterDataMaximaNascimento()) {
+    return 'Data de nascimento não pode ser futura.';
+  }
+
+  return null;
+}
+
+function criarEstadoInicialAtleta(usuario) {
+  return {
+    ...estadoInicialAtleta,
+    nome: usuario?.nome || '',
+    email: usuario?.email || ''
+  };
+}
+
+function obterMensagemErroPerfil(error) {
+  const mensagem = extrairMensagemErro(error);
+  if (mensagem === mensagemErroAcessoOrganizador) {
+    return 'Não foi possível atualizar o atleta vinculado por este perfil.';
+  }
+
+  return mensagem;
+}
+
+function criarResumoAtleta(atleta) {
+  if (!atleta) {
+    return null;
+  }
+
+  return {
+    id: atleta.id,
+    nome: atleta.nome,
+    apelido: atleta.apelido,
+    telefone: formatarTelefoneParaInput(atleta.telefone),
+    email: atleta.email,
+    instagram: atleta.instagram,
+    cpf: formatarCpfParaInput(atleta.cpf),
+    cadastroPendente: Boolean(atleta.cadastroPendente),
+    bairro: atleta.bairro,
+    cidade: atleta.cidade,
+    estado: atleta.estado,
+    nivel: atleta.nivel
+  };
+}
+
+function obterNomeCompletoMeuPerfil(atleta, usuarioBase, perfilUsuario) {
+  if (Number(perfilUsuario) === PERFIS_USUARIO.atleta) {
+    return atleta?.nome || usuarioBase?.nome || '';
+  }
+
+  return atleta?.nome || '';
+}
+
+export function PaginaMeuPerfil() {
+  const {
+    usuario,
+    atualizarUsuarioLocal,
+    recarregarUsuario,
+    concluirPrimeiroAcesso,
+    primeiroAcessoPendente,
+    estadoAcesso
+  } = useAutenticacao();
+  const [usuarioDetalhe, setUsuarioDetalhe] = useState(null);
+  const [formularioUsuario, setFormularioUsuario] = useState({ nome: '' });
+  const [formularioAtleta, setFormularioAtleta] = useState(estadoInicialAtleta);
+  const [carregando, setCarregando] = useState(true);
+  const [salvandoUsuario, setSalvandoUsuario] = useState(false);
+  const [salvandoAtleta, setSalvandoAtleta] = useState(false);
+  const [cidadesEstado, setCidadesEstado] = useState([]);
+  const [carregandoCidades, setCarregandoCidades] = useState(false);
+  const [erro, setErro] = useState('');
+  const [mensagem, setMensagem] = useState('');
+  const emailUsuarioPerfil = usuarioDetalhe?.email || usuario?.email || '';
+
+  useEffect(() => {
+    carregarPerfil();
+  }, [usuario?.id]);
+
+  useEffect(() => {
+    if (!formularioAtleta.estado) {
+      setCidadesEstado([]);
+      return;
+    }
+
+    let ativo = true;
+    setCarregandoCidades(true);
+
+    buscarCidadesPorEstado(formularioAtleta.estado)
+      .then((cidades) => {
+        if (ativo) {
+          setCidadesEstado(cidades);
+        }
+      })
+      .catch(() => {
+        if (ativo) {
+          setCidadesEstado([]);
+        }
+      })
+      .finally(() => {
+        if (ativo) {
+          setCarregandoCidades(false);
+        }
+      });
+
+    return () => {
+      ativo = false;
+    };
+  }, [formularioAtleta.estado]);
+
+  async function carregarPerfil() {
+    setCarregando(true);
+    setErro('');
+    setMensagem('');
+
+    try {
+      if (!usuario) {
+        setUsuarioDetalhe(null);
+        setFormularioAtleta(estadoInicialAtleta);
+        return;
+      }
+
+      const dadosUsuario = await recarregarUsuario();
+      setFormularioUsuario({ nome: dadosUsuario.nome || '' });
+
+      if (dadosUsuario.atletaId) {
+        const atleta = await atletasServico.obterMeu();
+        if (atleta) {
+          preencherFormularioAtleta(atleta);
+          setUsuarioDetalhe({
+            ...dadosUsuario,
+            atleta: criarResumoAtleta(atleta)
+          });
+        } else {
+          const usuarioSemAtleta = {
+            ...dadosUsuario,
+            atletaId: null,
+            atleta: null
+          };
+
+          setUsuarioDetalhe(usuarioSemAtleta);
+          atualizarUsuarioLocal(usuarioSemAtleta);
+          setFormularioAtleta(criarEstadoInicialAtleta(dadosUsuario));
+          setErro('Atleta vinculado não encontrado. Você pode criar novamente seu atleta pelo perfil.');
+        }
+      } else {
+        setUsuarioDetalhe(dadosUsuario);
+        setFormularioAtleta(criarEstadoInicialAtleta(dadosUsuario));
+      }
+    } catch (error) {
+      setErro(extrairMensagemErro(error));
+    } finally {
+      setCarregando(false);
+    }
+  }
+
+  function preencherFormularioAtleta(atleta) {
+    const perfilUsuario = usuarioDetalhe?.perfil || usuario?.perfil;
+    const usuarioBase = usuarioDetalhe || usuario;
+
+    setFormularioAtleta({
+      nome: obterNomeCompletoMeuPerfil(atleta, usuarioBase, perfilUsuario),
+      apelido: atleta.apelido || '',
+      telefone: formatarTelefoneParaInput(atleta.telefone),
+      email: emailUsuarioPerfil,
+      instagram: atleta.instagram || '',
+      cpf: formatarCpfParaInput(atleta.cpf),
+      bairro: atleta.bairro || '',
+      cidade: atleta.cidade || '',
+      estado: normalizarEstadoParaUf(atleta.estado || ''),
+      cadastroPendente: Boolean(atleta.cadastroPendente),
+      nivel: atleta.nivel ? String(atleta.nivel) : '',
+      lado: String(atleta.lado || 3),
+      dataNascimento: paraInputData(atleta.dataNascimento)
+    });
+  }
+
+  function atualizarCampoAtleta(campo, valor) {
+    if (campo === 'telefone') {
+      setFormularioAtleta((anterior) => ({ ...anterior, telefone: formatarTelefoneParaInput(valor) }));
+      return;
+    }
+
+    if (campo === 'cpf') {
+      setFormularioAtleta((anterior) => ({ ...anterior, cpf: formatarCpfParaInput(valor) }));
+      return;
+    }
+
+    if (campo === 'estado') {
+      setFormularioAtleta((anterior) => ({
+        ...anterior,
+        estado: valor,
+        cidade: valor === anterior.estado ? anterior.cidade : ''
+      }));
+      return;
+    }
+
+    setFormularioAtleta((anterior) => ({ ...anterior, [campo]: valor }));
+  }
+
+  async function salvarUsuario(evento) {
+    evento.preventDefault();
+
+    if (Number(usuarioDetalhe?.perfil || usuario?.perfil) !== PERFIS_USUARIO.administrador) {
+      return;
+    }
+
+    setSalvandoUsuario(true);
+    setErro('');
+    setMensagem('');
+
+    try {
+      const usuarioAtualizado = await usuariosServico.atualizarMeu({
+        nome: formularioUsuario.nome
+      });
+
+      setUsuarioDetalhe((anterior) => ({
+        ...(anterior || usuarioAtualizado),
+        ...usuarioAtualizado,
+        atleta: anterior?.atleta || usuarioAtualizado.atleta || null
+      }));
+      atualizarUsuarioLocal(usuarioAtualizado);
+
+      if (primeiroAcessoPendente) {
+        concluirPrimeiroAcesso();
+      }
+
+      setMensagem('Dados do acesso atualizados com sucesso.');
+      rolarParaTopo();
+    } catch (error) {
+      setErro(extrairMensagemErro(error));
+    } finally {
+      setSalvandoUsuario(false);
+    }
+  }
+
+  function finalizarPrimeiroAcesso() {
+    concluirPrimeiroAcesso();
+    setMensagem('Primeiro acesso concluído com sucesso.');
+    setErro('');
+  }
+
+  async function salvarAtleta(evento) {
+    evento.preventDefault();
+    const cpfLimpo = limparCpf(formularioAtleta.cpf);
+    if (cpfLimpo && !validarCpf(cpfLimpo)) {
+      setErro('CPF inválido.');
+      setMensagem('');
+      return;
+    }
+
+    const erroDataNascimento = validarDataNascimento(formularioAtleta.dataNascimento);
+    if (erroDataNascimento) {
+      setErro(erroDataNascimento);
+      setMensagem('');
+      return;
+    }
+
+    setSalvandoAtleta(true);
+    setErro('');
+    setMensagem('');
+
+    const dados = {
+      nome: formularioAtleta.nome,
+      apelido: formularioAtleta.apelido.trim() || null,
+      telefone: limparTelefone(formularioAtleta.telefone) || null,
+      email: emailUsuarioPerfil || null,
+      instagram: formularioAtleta.instagram.trim() || null,
+      cpf: cpfLimpo || null,
+      bairro: formularioAtleta.bairro.trim() || null,
+      cidade: formularioAtleta.cidade.trim() || null,
+      estado: normalizarEstadoParaUf(formularioAtleta.estado.trim()) || null,
+      cadastroPendente: Boolean(formularioAtleta.cadastroPendente),
+      nivel: formularioAtleta.nivel ? Number(formularioAtleta.nivel) : null,
+      lado: Number(formularioAtleta.lado),
+      dataNascimento: normalizarDataParaApi(formularioAtleta.dataNascimento)
+    };
+
+    try {
+      const atleta = await atletasServico.salvarMeu(dados);
+      const possuiAtletaAnterior = Boolean(usuarioDetalhe?.atletaId);
+      const usuarioAtualEhAtleta = Number(usuarioDetalhe?.perfil || usuario?.perfil) === PERFIS_USUARIO.atleta;
+      const proximoUsuario = {
+        ...(usuarioDetalhe || usuario),
+        nome: usuarioAtualEhAtleta ? atleta.nome : (usuarioDetalhe || usuario)?.nome,
+        atletaId: atleta.id,
+        atleta: criarResumoAtleta(atleta)
+      };
+
+      preencherFormularioAtleta(atleta);
+      setUsuarioDetalhe(proximoUsuario);
+      atualizarUsuarioLocal(proximoUsuario);
+      if (primeiroAcessoPendente) {
+        concluirPrimeiroAcesso();
+      }
+      setMensagem(possuiAtletaAnterior ? 'Dados do atleta atualizados com sucesso.' : 'Atleta criado com sucesso.');
+      rolarParaTopo();
+    } catch (error) {
+      setErro(obterMensagemErroPerfil(error));
+    } finally {
+      setSalvandoAtleta(false);
+    }
+  }
+
+  if (carregando) {
+    return (
+      <section className="pagina">
+        <div className="cabecalho-pagina">
+          <h2>Meu Perfil</h2>
+          <p>Carregando dados do usuário...</p>
+        </div>
+      </section>
+    );
+  }
+
+  const usuarioEhAtleta = Number(usuarioDetalhe?.perfil || usuario?.perfil) === PERFIS_USUARIO.atleta;
+  const usuarioEhAdministrador = Number(usuarioDetalhe?.perfil || usuario?.perfil) === PERFIS_USUARIO.administrador;
+  const possuiAtleta = Boolean(usuarioDetalhe?.atletaId);
+  const textoBotao = possuiAtleta
+    ? 'Salvar atleta'
+    : (usuarioEhAtleta ? 'Criar meu atleta' : 'Criar e vincular atleta');
+
+  return (
+    <section className="pagina">
+      {erro && <p className="texto-erro">{erro}</p>}
+      {mensagem && <p className="texto-sucesso">{mensagem}</p>}
+
+      {primeiroAcessoPendente && !usuarioEhAtleta && (
+        <article className="cartao">
+          <h3>Primeiro acesso</h3>
+          <p>Revise seus dados de acesso. O vínculo com atleta é opcional para este perfil.</p>
+          <div className="acoes-formulario">
+            <button type="button" className="botao-secundario" onClick={finalizarPrimeiroAcesso}>
+              Concluir primeiro acesso
+            </button>
+          </div>
+        </article>
+      )}
+
+      {usuarioEhAdministrador && (
+        <form className="formulario-secoes" onSubmit={salvarUsuario}>
+          <div className="secao-formulario">
+            <div className="secao-formulario-cabecalho">
+              <h3>Dados do acesso</h3>
+            </div>
+
+            <div className="secao-formulario-conteudo">
+              <label className="campo-largo">
+                Nome do usuário
+                <input
+                  type="text"
+                  value={formularioUsuario.nome}
+                  onChange={(evento) => setFormularioUsuario({ nome: evento.target.value })}
+                  required
+                />
+              </label>
+
+              <label className="campo-largo">
+                E-mail
+                <input
+                  type="email"
+                  value={emailUsuarioPerfil}
+                  readOnly
+                  disabled
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="acoes-formulario campo-largo">
+            <button type="submit" className="botao-primario" disabled={salvandoUsuario}>
+              {salvandoUsuario ? 'Salvando...' : 'Salvar acesso'}
+            </button>
+          </div>
+        </form>
+      )}
+
+      <form className="formulario-secoes" onSubmit={salvarAtleta}>
+        <div className="secao-formulario">
+          <div className="secao-formulario-cabecalho">
+            <h3>Identificação</h3>
+            {!usuarioEhAtleta && <p>Vínculo com atleta opcional para este perfil.</p>}
+          </div>
+
+          <div className="secao-formulario-conteudo">
+            <label className="campo-largo">
+              Nome completo
+              <input
+                type="text"
+                value={formularioAtleta.nome}
+                onChange={(evento) => atualizarCampoAtleta('nome', evento.target.value)}
+                required
+              />
+            </label>
+
+            <label>
+              Apelido
+              <input
+                type="text"
+                value={formularioAtleta.apelido}
+                onChange={(evento) => atualizarCampoAtleta('apelido', evento.target.value)}
+              />
+            </label>
+
+            <label>
+              Data de nascimento
+              <input
+                type="date"
+                value={formularioAtleta.dataNascimento}
+                onChange={(evento) => atualizarCampoAtleta('dataNascimento', evento.target.value)}
+                min={dataMinimaNascimento}
+                max={obterDataMaximaNascimento()}
+              />
+            </label>
+
+            <label>
+              CPF
+              <input
+                type="text"
+                value={formularioAtleta.cpf}
+                onChange={(evento) => atualizarCampoAtleta('cpf', evento.target.value)}
+              />
+            </label>
+
+          </div>
+        </div>
+
+        <div className="secao-formulario">
+          <div className="secao-formulario-cabecalho">
+            <h3>Contato</h3>
+          </div>
+
+          <div className="secao-formulario-conteudo">
+            <label>
+              Telefone
+              <input
+                type="text"
+                value={formularioAtleta.telefone}
+                onChange={(evento) => atualizarCampoAtleta('telefone', evento.target.value)}
+              />
+            </label>
+
+            <label>
+              E-mail
+              <input
+                type="email"
+                value={emailUsuarioPerfil}
+                readOnly
+                disabled
+              />
+            </label>
+
+            <label>
+              Instagram
+              <input
+                type="text"
+                value={formularioAtleta.instagram}
+                onChange={(evento) => atualizarCampoAtleta('instagram', evento.target.value)}
+              />
+            </label>
+
+            <label>
+              Estado
+              <select
+                value={formularioAtleta.estado}
+                onChange={(evento) => atualizarCampoAtleta('estado', evento.target.value)}
+              >
+                <option value="">Selecione</option>
+                {estadosBrasil.map((estado) => (
+                  <option key={estado.sigla} value={estado.sigla}>
+                    {estado.nome}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              Cidade
+              <input
+                type="text"
+                list="cidades-estado-perfil"
+                value={formularioAtleta.cidade}
+                onChange={(evento) => atualizarCampoAtleta('cidade', evento.target.value)}
+                placeholder={formularioAtleta.estado ? 'Digite para buscar' : 'Selecione o estado'}
+              />
+              <datalist id="cidades-estado-perfil">
+                {cidadesEstado.map((cidade) => (
+                  <option key={cidade} value={cidade} />
+                ))}
+              </datalist>
+              {carregandoCidades && <small>Carregando cidades...</small>}
+            </label>
+
+            <label>
+              Bairro
+              <input
+                type="text"
+                value={formularioAtleta.bairro}
+                onChange={(evento) => atualizarCampoAtleta('bairro', evento.target.value)}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div className="secao-formulario">
+          <div className="secao-formulario-cabecalho">
+            <h3>Detalhes esportivos e cadastro</h3>
+          </div>
+
+          <div className="secao-formulario-conteudo">
+            <label>
+              Lado
+              <select
+                value={formularioAtleta.lado}
+                onChange={(evento) => atualizarCampoAtleta('lado', evento.target.value)}
+              >
+                <option value="1">Direito</option>
+                <option value="2">Esquerdo</option>
+                <option value="3">Ambos</option>
+              </select>
+            </label>
+
+            <label>
+              Nível
+              <select
+                value={formularioAtleta.nivel}
+                onChange={(evento) => atualizarCampoAtleta('nivel', evento.target.value)}
+              >
+                <option value="">Selecione</option>
+                {opcoesNivelAtleta.map((opcao) => (
+                  <option key={opcao.valor} value={opcao.valor}>
+                    {opcao.rotulo}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div className="acoes-formulario campo-largo">
+          <button type="submit" className="botao-primario" disabled={salvandoAtleta}>
+            {salvandoAtleta ? 'Salvando...' : textoBotao}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
